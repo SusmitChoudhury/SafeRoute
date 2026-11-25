@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode & test/matplotlib/osmnx caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+/.cache/
+/cache/
+
+# Runtime logs and generated SQLite database (recreated from data/incidents_seed.csv)
+logs/*.log
+db/*.db
+db/*.db-journal
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

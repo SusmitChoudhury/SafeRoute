@@ -1,0 +1,13 @@
+osmnx>=2.0
+networkx
+numpy
+pandas
+matplotlib
+contextily
+shapely
+scipy
+pygame
+plyer
+Pillow
+pytest
+
