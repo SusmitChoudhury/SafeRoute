@@ -137,12 +137,54 @@ class Walker:
         self.total_distance_m = accumulated
         self.is_finished = (self.total_distance_m == 0.0)
 
-        # Set initial coordinates at start
-        self.x, self.y = self.points[0]
+        # Preserve progress along the shared prefix when rebuilding after a live reroute
+        if self.distance_travelled > 0.0 and self.total_distance_m > 0.0:
+            self.distance_travelled = min(self.distance_travelled, self.total_distance_m)
+            if self.distance_travelled >= self.total_distance_m:
+                self.x, self.y = self.points[-1]
+                lon, lat = self.transformer_to_latlon.transform(self.x, self.y)
+                self.lat = float(lat)
+                self.lon = float(lon)
+                self.next_node_ahead = self.path[-1]
+                self.is_finished = True
+            else:
+                self._sync_pose_at_distance()
+        else:
+            self.x, self.y = self.points[0]
+            lon, lat = self.transformer_to_latlon.transform(self.x, self.y)
+            self.lat = float(lat)
+            self.lon = float(lon)
+            self.next_node_ahead = self.path[1] if len(self.path) > 1 else self.path[0]
+
+    def _sync_pose_at_distance(self) -> None:
+        """Interpolate coordinates and next_node_ahead at the current ``distance_travelled``."""
+        idx = bisect.bisect_right(self.cum_dist, self.distance_travelled)
+        if idx <= 0:
+            idx = 1
+        elif idx >= len(self.points):
+            idx = len(self.points) - 1
+
+        seg_start_dist = self.cum_dist[idx - 1]
+        seg_end_dist = self.cum_dist[idx]
+        seg_len = max(1e-6, seg_end_dist - seg_start_dist)
+        fraction = (self.distance_travelled - seg_start_dist) / seg_len
+        p1 = self.points[idx - 1]
+        p2 = self.points[idx]
+
+        self.x = p1[0] + fraction * (p2[0] - p1[0])
+        self.y = p1[1] + fraction * (p2[1] - p1[1])
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        if dx != 0.0 or dy != 0.0:
+            self.heading_deg = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+
         lon, lat = self.transformer_to_latlon.transform(self.x, self.y)
         self.lat = float(lat)
         self.lon = float(lon)
-        self.next_node_ahead = self.path[1] if len(self.path) > 1 else self.path[0]
+
+        seg_idx = idx - 1
+        if seg_idx < len(self.segment_target_node):
+            self.next_node_ahead = self.segment_target_node[seg_idx]
 
     def update(self, sim_dt: float) -> None:
         """Advance the walker position by speed * sim_dt.

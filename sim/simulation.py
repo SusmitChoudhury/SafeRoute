@@ -38,6 +38,7 @@ from core.graph_loader import load_graph, snap_to_node
 from core.lookahead import (
     EntryIndex,
     build_entry_index,
+    check_remaining_route_hazard,
     query_ahead,
     route_polyline,
 )
@@ -335,9 +336,31 @@ class Simulation:
             curr_idx = self.current_route.index(origin_node)
             prefix = self.current_route[:curr_idx]
         except ValueError:
+            curr_idx = 0
             prefix = []
 
         weight_fn = make_weight_fn(self.G, self.route_risks, self.mode, active_incidents, lam=2.0)
+
+        # If a hazard was dropped onto the active segment between prev_node and origin_node,
+        # allow turning around at prev_node if that intersection yields an alternate exit.
+        backtrack_dist_m = None
+        if curr_idx >= 1 and self.walker and self.G.has_edge(self.current_route[curr_idx - 1], origin_node):
+            prev_node = self.current_route[curr_idx - 1]
+            edge_risk_cur = max(
+                self.route_risks.get((prev_node, origin_node, k), 0.0)
+                for k in self.G[prev_node][origin_node]
+            )
+            if edge_risk_cur > 0.0:
+                _, prev_cum = route_polyline(self.G, self.current_route[:curr_idx])
+                prev_cum_m = float(prev_cum[-1]) if len(prev_cum) > 0 else 0.0
+                if (self.walker.distance_travelled - prev_cum_m) <= 100.0:
+                    bt_res = dijkstra(self.G, prev_node, self.end_node, weight_fn=weight_fn)
+                    if not math.isinf(bt_res.cost) and len(bt_res.path) > 1 and bt_res.path[1] != origin_node:
+                        origin_node = prev_node
+                        curr_idx = curr_idx - 1
+                        prefix = self.current_route[:curr_idx]
+                        backtrack_dist_m = prev_cum_m
+
         d_res = dijkstra(self.G, origin_node, self.end_node, weight_fn=weight_fn)
         self.logger.log("STEP 3/6", "search", f"Dijkstra node {origin_node} -> {self.end_node}: explored {d_res.explored} nodes, {d_res.relaxations} relaxations, {d_res.elapsed_ms:.1f} ms", self.sim_time)
 
@@ -384,6 +407,8 @@ class Simulation:
         self.route_stats = new_stats
         self.reroute_count += 1
         self.incidents_avoided += 1
+        if backtrack_dist_m is not None:
+            self.walker.distance_travelled = backtrack_dist_m
         self.walker.set_new_route(self.current_route)
         self._rebuild_lookahead_index()
         self.triggered_incidents.add(inc_id)
@@ -416,7 +441,7 @@ class Simulation:
         self.warning_2_banner = f"WARNING 2: Rerouted! Avoids {inc_type} #{inc_id} (+{extra_dist:.0f} m, +{extra_min:.1f} min)"
 
     def drop_incident(self, lat: float, lon: float, inc_type: str = "accident") -> int:
-        """Drop a new danger zone incident and recheck route look-ahead immediately.
+        """Drop a new danger zone incident and recheck remaining route immediately.
 
         Args:
             lat: Latitude.
@@ -427,52 +452,78 @@ class Simulation:
             int: Inserted incident ID.
         """
         inc_id = self.incident_store.add_incident(inc_type, lat, lon, source="live")
+        active_now = self.incident_store.get_active_incidents()
+        self.route_risks = compute_edge_risk(self.G, active_now, self.mode)
         self._rebuild_lookahead_index()
+        inc = next((i for i in active_now if i.id == inc_id), None)
 
         horizon = float("inf") if self.detection_mode == "instant" else LOOKAHEAD_M
-        if self.state in (SimState.MOVING, SimState.WARNING_2) and self.walker:
+        if self.state in (SimState.MOVING, SimState.WARNING_1, SimState.WARNING_2) and self.walker and inc:
             s_now = self.walker.distance_travelled
-            hits = query_ahead(self.lookahead_index, s_now, horizon)
-            if inc_id in hits and inc_id not in self.triggered_incidents:
-                self.triggered_incidents.add(inc_id)
+            s_enter = None
+            if self.polyline_pts is not None and len(self.polyline_pts) >= 2:
+                s_enter = check_remaining_route_hazard(
+                    self.polyline_pts, self.polyline_cum, s_now, inc, horizon_m=horizon
+                )
+            if s_enter is None and inc_id in query_ahead(self.lookahead_index, s_now, horizon):
                 idx = self.lookahead_index.entry_ids.index(inc_id)
                 s_enter = self.lookahead_index.entry_keys[idx]
-                gap = s_enter - s_now
+
+            if s_enter is not None and inc_id not in self.triggered_incidents:
+                self.triggered_incidents.add(inc_id)
+                gap = max(0.0, s_enter - s_now)
                 self.trigger_warning_1_and_reroute(inc_id, s_enter, gap)
-        elif self.state == SimState.IDLE:
-            hits = query_ahead(self.lookahead_index, 0.0, float("inf"))
-            if inc_id in hits:
+            else:
+                self.logger.log("ALERT", "incident", f"#{inc_id} {inc_type} dropped at ({lat:.4f}, {lon:.4f})", self.sim_time)
+        elif self.state == SimState.IDLE and inc:
+            s_enter = None
+            if self.polyline_pts is not None and len(self.polyline_pts) >= 2:
+                s_enter = check_remaining_route_hazard(
+                    self.polyline_pts, self.polyline_cum, 0.0, inc, horizon_m=float("inf")
+                )
+            if s_enter is not None or inc_id in query_ahead(self.lookahead_index, 0.0, float("inf")):
+                self.logger.log("ALERT", "incident", f"#{inc_id} {inc_type} intersects route; recalculating", self.sim_time)
                 self._calculate_initial_route()
+            else:
+                self.logger.log("ALERT", "incident", f"#{inc_id} {inc_type} dropped at ({lat:.4f}, {lon:.4f})", self.sim_time)
         else:
             self.logger.log("ALERT", "incident", f"#{inc_id} {inc_type} dropped at ({lat:.4f}, {lon:.4f})", self.sim_time)
 
         return inc_id
 
     def move_incident(self, inc_id: int, lat: float, lon: float) -> bool:
-        """Update the position of an existing incident (supports drag-and-drop) and recheck look-ahead."""
+        """Update the position of an existing incident (supports drag-and-drop) and recheck route."""
         success = self.incident_store.move_incident(inc_id, lat, lon)
         if not success:
             return False
 
         self.triggered_incidents.discard(inc_id)
-        self._rebuild_lookahead_index()
         active_now = self.incident_store.get_active_incidents()
         self.route_risks = compute_edge_risk(self.G, active_now, self.mode)
+        self._rebuild_lookahead_index()
+        inc = next((i for i in active_now if i.id == inc_id), None)
 
         horizon = float("inf") if self.detection_mode == "instant" else LOOKAHEAD_M
-        if self.state in (SimState.MOVING, SimState.WARNING_2) and self.walker:
+        if self.state in (SimState.MOVING, SimState.WARNING_1, SimState.WARNING_2) and self.walker and inc:
             s_now = self.walker.distance_travelled
-            hits = query_ahead(self.lookahead_index, s_now, horizon)
-            if inc_id in hits:
-                self.triggered_incidents.add(inc_id)
+            s_enter = None
+            if self.polyline_pts is not None and len(self.polyline_pts) >= 2:
+                s_enter = check_remaining_route_hazard(
+                    self.polyline_pts, self.polyline_cum, s_now, inc, horizon_m=horizon
+                )
+            if s_enter is None and inc_id in query_ahead(self.lookahead_index, s_now, horizon):
                 idx = self.lookahead_index.entry_ids.index(inc_id)
                 s_enter = self.lookahead_index.entry_keys[idx]
-                gap = s_enter - s_now
+
+            if s_enter is not None:
+                self.triggered_incidents.add(inc_id)
+                gap = max(0.0, s_enter - s_now)
                 self.trigger_warning_1_and_reroute(inc_id, s_enter, gap)
+            else:
+                self.logger.log("INFO", "incident", f"#{inc_id} repositioned to ({lat:.4f}, {lon:.4f})", self.sim_time)
         elif self.state == SimState.IDLE:
-            hits = query_ahead(self.lookahead_index, 0.0, float("inf"))
-            if inc_id in hits:
-                self._calculate_initial_route()
+            self._calculate_initial_route()
+            self.logger.log("INFO", "incident", f"#{inc_id} repositioned to ({lat:.4f}, {lon:.4f})", self.sim_time)
         else:
             self.logger.log("INFO", "incident", f"#{inc_id} repositioned to ({lat:.4f}, {lon:.4f})", self.sim_time)
 
@@ -499,7 +550,7 @@ class Simulation:
         closest_inc = None
         min_dist = float("inf")
         for inc in active_incidents:
-            dist = math.hypot(inc.utm_x - utm_x, inc.utm_y - utm_y)
+            dist = math.hypot(inc.x - utm_x, inc.y - utm_y)
             if dist < min_dist:
                 min_dist = dist
                 closest_inc = inc
@@ -511,15 +562,16 @@ class Simulation:
             self.logger.log("INFO", "incident", f"#{inc_id} {closest_inc.type} removed", self.sim_time)
 
             # Re-evaluate route and lookahead index
-            self._rebuild_lookahead_index()
-            # If idle or moving, re-compute route risks
             active_now = self.incident_store.get_active_incidents()
             self.route_risks = compute_edge_risk(self.G, active_now, self.mode)
+            self._rebuild_lookahead_index()
+            if self.state == SimState.IDLE:
+                self._calculate_initial_route()
             return inc_id
         return None
 
     def set_endpoint(self, which: str, lat: float, lon: float) -> tuple[Optional[int], float]:
-        """Update start or end endpoint and recalculate route.
+        """Update Point 1 ('start') or Point 2 ('end') endpoint and recalculate route.
 
         Args:
             which: 'start' or 'end'.
@@ -533,23 +585,32 @@ class Simulation:
             self.start_latlon = (lat, lon)
             self.start_node, dist = snap_to_node(self.G, lat, lon)
             self._check_endpoint_hazard("start", lat, lon)
-            self.logger.log("INFO", "snap", f"start relocated to ({lat:.4f}, {lon:.4f}) -> node {self.start_node} ({dist:.1f} m)", self.sim_time)
-            if self.state == SimState.IDLE or not self.walker:
-                self._calculate_initial_route()
+            self.logger.log("INFO", "snap", f"Point 1 (start) set to ({lat:.4f}, {lon:.4f}) -> node {self.start_node} ({dist:.1f} m)", self.sim_time)
+            if self.state != SimState.IDLE:
+                self.state = SimState.IDLE
+                self.is_paused = False
+                self.sim_time = 0.0
+                self.warning_timer = 0.0
+                self.previous_route = []
+            self._calculate_initial_route()
             return self.start_node, dist
 
         elif which == "end":
             self.end_latlon = (lat, lon)
             self.end_node, dist = snap_to_node(self.G, lat, lon)
             self._check_endpoint_hazard("end", lat, lon)
-            self.logger.log("INFO", "snap", f"goal relocated to ({lat:.4f}, {lon:.4f}) -> node {self.end_node} ({dist:.1f} m)", self.sim_time)
+            self.logger.log("INFO", "snap", f"Point 2 (goal) set to ({lat:.4f}, {lon:.4f}) -> node {self.end_node} ({dist:.1f} m)", self.sim_time)
 
-            if self.state == SimState.IDLE or not self.walker:
+            if self.state in (SimState.IDLE, SimState.ARRIVED) or not self.walker:
+                self.state = SimState.IDLE
+                self.is_paused = False
+                self.previous_route = []
                 self._calculate_initial_route()
-            elif self.state in (SimState.MOVING, SimState.WARNING_2):
+            elif self.state in (SimState.MOVING, SimState.WARNING_1, SimState.WARNING_2):
                 active_incidents = self.incident_store.get_active_incidents()
+                self.route_risks = compute_edge_risk(self.G, active_incidents, self.mode)
                 origin_node = self.walker.next_node_ahead if (self.walker and self.walker.next_node_ahead) else self.start_node
-                new_res, comp = reroute(self.G, origin_node, self.end_node, active_incidents, self.mode, self.route_result)
+                new_res, _ = reroute(self.G, origin_node, self.end_node, active_incidents, self.mode, self.route_result)
                 try:
                     curr_idx = self.current_route.index(origin_node)
                     prefix = self.current_route[:curr_idx]
@@ -562,9 +623,44 @@ class Simulation:
                 self.walker.set_new_route(self.current_route)
                 self._rebuild_lookahead_index()
                 self._check_route_campus_footpaths(self.current_route)
+                alts = compute_route_alternatives(
+                    self.G, origin_node, self.end_node, active_incidents, self.mode, risks=self.route_risks
+                )
+                for alt in alts.values():
+                    alt["full_path"] = prefix + list(alt["path"])
+                self.route_alternatives = alts
+                self.active_route_name = "balanced"
+                self._compute_all_mode_etas()
             return self.end_node, dist
 
         return None, 0.0
+
+    def set_route_points(
+        self,
+        start_latlon: tuple[float, float],
+        end_latlon: tuple[float, float],
+    ) -> tuple[tuple[Optional[int], float], tuple[Optional[int], float]]:
+        """Atomically set both Point 1 (start) and Point 2 (goal) and draw hazard-aware route."""
+        self.start_latlon = (float(start_latlon[0]), float(start_latlon[1]))
+        self.end_latlon = (float(end_latlon[0]), float(end_latlon[1]))
+        self.start_node, d1 = snap_to_node(self.G, *self.start_latlon)
+        self.end_node, d2 = snap_to_node(self.G, *self.end_latlon)
+        self._check_endpoint_hazard("start", *self.start_latlon)
+        self._check_endpoint_hazard("end", *self.end_latlon)
+        self.state = SimState.IDLE
+        self.is_paused = False
+        self.sim_time = 0.0
+        self.warning_timer = 0.0
+        self.previous_route = []
+        self.triggered_incidents.clear()
+        self.logger.log(
+            "ROUTE",
+            "endpoints",
+            f"route selection: Point 1 ({self.start_latlon[0]:.4f}, {self.start_latlon[1]:.4f}) -> Point 2 ({self.end_latlon[0]:.4f}, {self.end_latlon[1]:.4f})",
+            self.sim_time,
+        )
+        self._calculate_initial_route()
+        return (self.start_node, d1), (self.end_node, d2)
 
     def select_route(self, choice: str) -> bool:
         """Switch walker to follow one of the computed alternative routes ('fastest', 'balanced', 'safest')."""
@@ -734,6 +830,7 @@ class Simulation:
                 s_now = self.walker.distance_travelled
                 horizon = float("inf") if self.detection_mode == "instant" else LOOKAHEAD_M
                 hits = query_ahead(self.lookahead_index, s_now, horizon)
+                triggered_any = False
                 for inc_id in hits:
                     if inc_id not in self.triggered_incidents:
                         self.triggered_incidents.add(inc_id)
@@ -741,4 +838,17 @@ class Simulation:
                         s_enter = self.lookahead_index.entry_keys[idx]
                         gap = s_enter - s_now
                         self.trigger_warning_1_and_reroute(inc_id, s_enter, gap)
+                        triggered_any = True
                         break
+
+                if not triggered_any and self.polyline_pts is not None and len(self.polyline_pts) >= 2:
+                    for inc in self.incident_store.get_active_incidents():
+                        if not inc.active or inc.source == "historical" or inc.id in self.triggered_incidents:
+                            continue
+                        s_enter = check_remaining_route_hazard(
+                            self.polyline_pts, self.polyline_cum, s_now, inc, horizon_m=horizon
+                        )
+                        if s_enter is not None:
+                            self.triggered_incidents.add(inc.id)
+                            self.trigger_warning_1_and_reroute(inc.id, s_enter, max(0.0, s_enter - s_now))
+                            break

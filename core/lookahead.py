@@ -231,6 +231,50 @@ def query_ahead(
     return hits
 
 
+def check_remaining_route_hazard(
+    points: np.ndarray,
+    cum: np.ndarray,
+    s_now: float,
+    inc: Incident,
+    horizon_m: float = LOOKAHEAD_M,
+) -> Optional[float]:
+    """Check whether an active incident intersects the remaining route ahead of ``s_now``.
+
+    Slices ``points`` / ``cum`` at ``s_now`` (interpolating the exact current walker
+    position) and reuses ``zone_entry_distance`` on the remaining polyline so hazards
+    dropped on or overlapping the active segment at ``s_now`` are never missed by binary search.
+
+    Returns:
+        Optional[float]: Absolute cumulative entry distance ``s_enter >= s_now`` if
+        the incident enters within ``horizon_m`` ahead of ``s_now``, else ``None``.
+    """
+    if not inc.active or len(points) < 2 or len(cum) < 2:
+        return None
+
+    total_dist = float(cum[-1])
+    s_clamped = max(0.0, min(float(s_now), total_dist))
+    if s_clamped >= total_dist:
+        return None
+
+    cum_list = cum.tolist()
+    idx = bisect.bisect_right(cum_list, s_clamped)
+    idx = max(1, min(idx, len(points) - 1))
+
+    seg_start = float(cum[idx - 1])
+    seg_end = float(cum[idx])
+    seg_len = max(1e-6, seg_end - seg_start)
+    frac = (s_clamped - seg_start) / seg_len
+    cur_pt = points[idx - 1] + frac * (points[idx] - points[idx - 1])
+
+    rem_pts = np.vstack([cur_pt.reshape(1, 2), points[idx:]])
+    rem_cum = np.concatenate([[0.0], cum[idx:] - s_clamped])
+
+    gap_m = zone_entry_distance(rem_pts, rem_cum, (inc.x, inc.y), inc.radius_m)
+    if gap_m is not None and gap_m <= horizon_m:
+        return s_clamped + gap_m
+    return None
+
+
 _TRANSFORMER_UTM_TO_LATLON = pyproj.Transformer.from_crs("EPSG:32643", "EPSG:4326", always_xy=True)
 
 

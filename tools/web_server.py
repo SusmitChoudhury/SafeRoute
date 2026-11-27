@@ -12,6 +12,7 @@ Features:
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import argparse
 import io
 import json
 import os
@@ -343,6 +344,24 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
 
             self._send_json({"status": "ok", "which": which, "node": node, "dist_m": dist, "state": _host.get_state()})
 
+        elif path == "/api/set_route_points":
+            s_lat = float(data.get("start_lat", 0.0))
+            s_lon = float(data.get("start_lon", 0.0))
+            e_lat = float(data.get("end_lat", 0.0))
+            e_lon = float(data.get("end_lon", 0.0))
+
+            with _host.lock:
+                (n1, d1), (n2, d2) = _host.sim.set_route_points((s_lat, s_lon), (e_lat, e_lon))
+
+            self._send_json({
+                "status": "ok",
+                "start_node": n1,
+                "start_dist_m": d1,
+                "end_node": n2,
+                "end_dist_m": d2,
+                "state": _host.get_state(),
+            })
+
         elif path == "/api/remove_incident":
             inc_id = data.get("id")
             lat = float(data.get("lat", 0.0))
@@ -353,9 +372,11 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
                     removed_id = int(inc_id)
                     _host.sim.incident_store.remove_incident(removed_id)
                     _host.sim.triggered_incidents.discard(removed_id)
-                    _host.sim._rebuild_lookahead_index()
                     active_now = _host.sim.incident_store.get_active_incidents()
                     _host.sim.route_risks = compute_edge_risk(_host.sim.G, active_now, _host.sim.mode)
+                    _host.sim._rebuild_lookahead_index()
+                    if _host.sim.state == SimState.IDLE:
+                        _host.sim._calculate_initial_route()
                     _host.sim.logger.log("INFO", "incident", f"#{removed_id} removed", _host.sim.sim_time)
                 else:
                     removed_id = _host.sim.remove_incident_near(lat, lon, max_dist_m=120.0)
@@ -404,6 +425,12 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 
   <style>
+    :root {
+      --dock-h: 64px;
+      --surface-dark: rgba(10, 15, 29, 0.90);
+      --border-subtle: rgba(148, 163, 184, 0.18);
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body, html {
       width: 100%;
@@ -429,44 +456,51 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
         linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
       background-size: 24px 24px, 48px 48px, 48px 48px;
     }
+    #map.pick-cursor,
+    #map.pick-cursor .leaflet-grab {
+      cursor: crosshair !important;
+    }
 
     /* Glassmorphism Surface Style */
     .glass {
-      background: rgba(15, 23, 42, 0.88);
+      background: var(--surface-dark);
       backdrop-filter: blur(18px);
       -webkit-backdrop-filter: blur(18px);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+      border: 1px solid var(--border-subtle);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.48);
     }
 
     /* Top Left Brand Header */
     .brand-hud {
       position: absolute;
-      top: 16px;
-      left: 16px;
+      top: 14px;
+      left: 14px;
       z-index: 100;
       border-radius: 14px;
-      padding: 12px 18px;
+      padding: 10px 14px;
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
+      max-width: calc(100vw - 700px);
     }
     .brand-title {
-      font-size: 17px;
+      font-size: 16px;
       font-weight: 800;
       letter-spacing: -0.3px;
       background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
+      white-space: nowrap;
     }
     .brand-sub {
       font-size: 11px;
       color: #94a3b8;
       font-weight: 500;
       margin-top: 1px;
+      white-space: nowrap;
     }
     .status-badge {
-      font-size: 11px;
+      font-size: 10.5px;
       font-weight: 700;
       padding: 4px 10px;
       border-radius: 20px;
@@ -475,6 +509,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       display: flex;
       align-items: center;
       gap: 6px;
+      white-space: nowrap;
     }
     .status-dot {
       width: 7px;
@@ -490,25 +525,31 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     .status-WARNING_2 { background: rgba(16, 185, 129, 0.25); color: #10b981; }
     .status-ARRIVED { background: rgba(99, 102, 241, 0.25); color: #818cf8; }
 
+    /* Keep Leaflet Zoom Control directly below Brand HUD */
+    .leaflet-top.leaflet-left {
+      top: 82px !important;
+      left: 14px !important;
+    }
+
     @keyframes pulse {
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.7; transform: scale(1.04); }
     }
 
-    /* Warning Alert Banner (Top Center) */
+    /* Warning Alert Banner & Interactive Pick Banner (Top Center) */
     #warning-banner {
       position: absolute;
-      top: 16px;
+      top: 14px;
       left: 50%;
       transform: translateX(-50%) translateY(-100px);
       z-index: 200;
-      padding: 12px 24px;
+      padding: 10px 20px;
       border-radius: 12px;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 700;
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s;
       opacity: 0;
       pointer-events: none;
@@ -520,24 +561,77 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     .banner-w1 {
       background: linear-gradient(135deg, rgba(239, 68, 68, 0.95), rgba(185, 28, 28, 0.95));
       border: 1px solid #f87171;
-      box-shadow: 0 10px 30px rgba(239, 68, 68, 0.5);
+      box-shadow: 0 10px 30px rgba(239, 68, 68, 0.45);
       color: #fff;
     }
     .banner-w2 {
       background: linear-gradient(135deg, rgba(16, 185, 129, 0.95), rgba(5, 150, 105, 0.95));
       border: 1px solid #34d399;
-      box-shadow: 0 10px 30px rgba(16, 185, 129, 0.45);
+      box-shadow: 0 10px 30px rgba(16, 185, 129, 0.4);
       color: #fff;
     }
 
-    /* Layer Switcher (Top Right) */
+    #pick-mode-banner {
+      position: absolute;
+      top: 64px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-12px);
+      z-index: 190;
+      padding: 7px 15px;
+      border-radius: 999px;
+      background: rgba(14, 165, 233, 0.94);
+      border: 1px solid #7dd3fc;
+      color: #082f49;
+      font-size: 12.5px;
+      font-weight: 800;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      box-shadow: 0 10px 28px rgba(14, 165, 233, 0.45);
+    }
+    #pick-mode-banner.visible {
+      display: flex;
+      transform: translateX(-50%) translateY(0);
+    }
+    .pick-cancel-btn {
+      background: rgba(15, 23, 42, 0.88);
+      color: #f8fafc;
+      border: none;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    /* Floating Ghost Pill when Dragging a Hazard from Toolbar */
+    #drag-ghost-pill {
+      position: fixed;
+      z-index: 9999;
+      pointer-events: none;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.95);
+      border: 2px solid #ef4444;
+      color: #f8fafc;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.65);
+      transform: translate(-50%, -135%);
+      white-space: nowrap;
+    }
+
+    /* Layer Switcher (Top Right next to Dashboard) */
     .layer-hud {
       position: absolute;
-      top: 16px;
-      right: 470px;
+      top: 14px;
+      right: 446px;
       z-index: 100;
       border-radius: 12px;
-      padding: 6px;
+      padding: 5px;
       display: flex;
       gap: 4px;
     }
@@ -545,12 +639,13 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     /* Right Dashboard HUD */
     .dashboard-panel {
       position: absolute;
-      top: 16px;
-      right: 16px;
-      bottom: 96px;
-      width: 440px;
+      top: 14px;
+      right: 14px;
+      bottom: calc(var(--dock-h) + 22px);
+      width: 420px;
+      max-width: calc(100vw - 28px);
       z-index: 100;
-      border-radius: 18px;
+      border-radius: 16px;
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -558,33 +653,33 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
 
     /* Route Stats Card */
     .stats-card {
-      padding: 18px 20px 14px;
+      padding: 13px 16px 10px;
       border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     }
     .stats-row {
       display: flex;
       justify-content: space-between;
       align-items: baseline;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .route-dist {
-      font-size: 26px;
+      font-size: 22px;
       font-weight: 800;
       letter-spacing: -0.5px;
       color: #ffffff;
     }
     .route-eta {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 700;
       color: #38bdf8;
     }
     .progress-bar {
       width: 100%;
-      height: 6px;
+      height: 5px;
       background: rgba(255, 255, 255, 0.1);
       border-radius: 3px;
       overflow: hidden;
-      margin: 8px 0 12px;
+      margin: 6px 0 9px;
     }
     .progress-fill {
       height: 100%;
@@ -597,32 +692,143 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     .mode-compare-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-top: 10px;
+      gap: 6px;
+      margin-top: 8px;
     }
     .mode-compare-box {
       background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      border-radius: 10px;
-      padding: 7px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 9px;
+      padding: 5px 8px;
       text-align: center;
     }
-    .mode-compare-title { font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; }
-    .mode-compare-val { font-size: 13px; font-weight: 700; color: #34d399; margin-top: 2px; }
+    .mode-compare-title { font-size: 10px; color: #94a3b8; font-weight: 600; text-transform: uppercase; }
+    .mode-compare-val { font-size: 12.5px; font-weight: 700; color: #34d399; margin-top: 1px; }
 
     /* Key metrics row */
     .metrics-pills {
       display: flex;
-      gap: 10px;
-      margin-top: 12px;
-      font-size: 12px;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 11.5px;
       color: #cbd5e1;
+      flex-wrap: wrap;
     }
     .metric-item {
       background: rgba(255, 255, 255, 0.05);
-      padding: 4px 10px;
+      padding: 3px 9px;
       border-radius: 8px;
       font-weight: 600;
+    }
+
+    /* Two-Point Route Selector Card (P1 -> P2) */
+    .points-card {
+      padding: 9px 14px 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(15, 23, 42, 0.62);
+    }
+    .points-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 7px;
+      gap: 6px;
+    }
+    .points-header-title {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .points-actions {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+    }
+    .point-pick-main-btn {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 6px;
+      background: rgba(56, 189, 248, 0.16);
+      border: 1px solid rgba(56, 189, 248, 0.42);
+      color: #7dd3fc;
+      cursor: pointer;
+      transition: all 0.18s;
+    }
+    .point-pick-main-btn:hover, .point-pick-main-btn.pick-active {
+      background: #0284c7;
+      border-color: #38bdf8;
+      color: #fff;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
+    }
+    .point-swap-btn {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      color: #cbd5e1;
+      cursor: pointer;
+      transition: all 0.18s;
+    }
+    .point-swap-btn:hover {
+      background: rgba(255, 255, 255, 0.14);
+      color: #fff;
+    }
+    .points-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+    .point-pill {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 8px;
+      padding: 6px 8px;
+      cursor: pointer;
+      transition: all 0.18s ease;
+      text-align: left;
+    }
+    .point-pill.p1-pill { border-left: 3px solid #10b981; }
+    .point-pill.p2-pill { border-left: 3px solid #ef4444; }
+    .point-pill:hover {
+      background: rgba(255, 255, 255, 0.09);
+      border-color: rgba(255, 255, 255, 0.25);
+    }
+    .point-pill.pick-active {
+      background: rgba(16, 185, 129, 0.18);
+      border-color: #34d399;
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.35);
+    }
+    .point-pill.p2-pill.pick-active {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: #f87171;
+      box-shadow: 0 0 12px rgba(239, 68, 68, 0.35);
+    }
+    .point-pill-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .p1-pill .point-pill-top { color: #34d399; }
+    .p2-pill .point-pill-top { color: #f87171; }
+    .point-pill-tag {
+      font-size: 9px;
+      color: #94a3b8;
+      background: rgba(255, 255, 255, 0.07);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .point-pill-coords {
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+      font-size: 10.5px;
+      color: #e2e8f0;
+      margin-top: 2px;
     }
 
     /* Live Algorithm Log Console (Large 15px font for crisp recordings) */
@@ -1017,6 +1223,18 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     <span id="warning-msg">Danger ahead detected!</span>
   </div>
 
+  <!-- Interactive Point Pick Mode Banner -->
+  <div id="pick-mode-banner">
+    <span id="pick-mode-text">Step 1/2: Click anywhere on map for Point 1 (Start)</span>
+    <button class="pick-cancel-btn" onclick="cancelPickMode()">Cancel (Esc)</button>
+  </div>
+
+  <!-- Drag Ghost Indicator for Toolbar Hazard Dragging -->
+  <div id="drag-ghost-pill">
+    <span id="drag-ghost-emoji">🚨</span>
+    <span id="drag-ghost-label">Drop Hazard on Road</span>
+  </div>
+
   <!-- Right Dashboard & Live Console -->
   <div class="dashboard-panel glass">
     <!-- Stats Card -->
@@ -1024,7 +1242,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       <div class="stats-row">
         <div>
           <span class="route-dist" id="route-dist-text">542 m</span>
-          <span style="font-size: 13px; color: #94a3b8; margin-left: 6px;" id="traveled-text">(0 m traveled)</span>
+          <span style="font-size: 12.5px; color: #94a3b8; margin-left: 6px;" id="traveled-text">(0 m traveled)</span>
         </div>
         <div class="route-eta" id="eta-text">ETA: 6.5 min</div>
       </div>
@@ -1052,6 +1270,37 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
         <div class="metric-item">Reroutes: <span id="reroutes-count" style="color:#38bdf8">0</span></div>
         <div class="metric-item">Avoided: <span id="avoided-count" style="color:#34d399">0</span></div>
         <div class="metric-item">Warnings: <span id="warnings-count" style="color:#fbbf24">0</span></div>
+      </div>
+    </div>
+
+    <!-- Two-Point Route Selector Card (Point 1 -> Point 2) -->
+    <div class="points-card" id="points-card">
+      <div class="points-header">
+        <span class="points-header-title">📍 Route Points (P1 → P2)</span>
+        <div class="points-actions">
+          <button class="point-pick-main-btn" id="btn-pick-route" onclick="togglePickRouteMode()" title="Click 2 points on the map to set Point 1 and Point 2 and draw hazard-aware blue route">
+            🧭 Pick P1 → P2
+          </button>
+          <button class="point-swap-btn" onclick="swapRoutePoints()" title="Swap Point 1 and Point 2">
+            ⇅ Swap
+          </button>
+        </div>
+      </div>
+      <div class="points-grid">
+        <button class="point-pill p1-pill" id="btn-pick-p1" onclick="setPickMode('pick_p1')" title="Click, then click on map to move Point 1 (Current / Start)">
+          <div class="point-pill-top">
+            <span>📍 Point 1 (Start)</span>
+            <span class="point-pill-tag" id="p1-tag">Set P1</span>
+          </div>
+          <div class="point-pill-coords" id="p1-coords">31.2515, 75.7047</div>
+        </button>
+        <button class="point-pill p2-pill" id="btn-pick-p2" onclick="setPickMode('pick_p2')" title="Click, then click on map to move Point 2 (Next / Destination)">
+          <div class="point-pill-top">
+            <span>🏁 Point 2 (Goal)</span>
+            <span class="point-pill-tag" id="p2-tag">Set P2</span>
+          </div>
+          <div class="point-pill-coords" id="p2-coords">31.2559, 75.7042</div>
+        </button>
       </div>
     </div>
 
@@ -1143,31 +1392,31 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
   </div>
 
   <!-- Map Click & Drag Hint -->
-  <div class="map-hint glass">
-    💡 <b>Interactive Map:</b> Drag hazard button from toolbar or click road to drop. Drag hazard icons or START/GOAL pins to recalculate live! Right-click or ✕ to remove.
+  <div class="map-hint glass" id="map-hint">
+    💡 <b>Interactive Map:</b> Drag any hazard button onto the road or click map to drop. Drag existing hazard icons or <b>START/GOAL</b> pins (or use <b>Pick P1 → P2</b>) to recalculate live! Right-click or ✕ to remove.
   </div>
 
   <!-- Bottom Dock Toolbar -->
-  <div class="toolbar-dock glass">
+  <div class="toolbar-dock glass" id="toolbar-dock">
     <!-- Playback -->
     <div class="tool-group">
       <button class="btn btn-primary" id="btn-start" onclick="sendAction('start_pause')">
         <span id="start-icon">▶</span> <span id="start-label">Start</span>
       </button>
-      <button class="btn btn-gold" onclick="sendAction('demo')">
-        ⭐ Scripted Demo (F5)
+      <button class="btn btn-gold" onclick="sendAction('demo')" title="Run automated scripted demo (F5)">
+        ⭐ Demo (F5)
       </button>
-      <button class="btn" style="background:rgba(239,68,68,0.2); border-color:#ef4444;" onclick="clearAllHazards()">
-        🧹 Clear Hazards
+      <button class="btn btn-danger-soft" onclick="clearAllHazards()" title="Clear all dropped hazards">
+        🧹 Clear
       </button>
-      <button class="btn" onclick="sendAction('reset')">
+      <button class="btn" onclick="sendAction('reset')" title="Reset simulation (Esc)">
         ↺ Reset
       </button>
     </div>
 
     <!-- Mode Selector -->
     <div class="tool-group">
-      <span class="group-label">Mode:</span>
+      <span class="group-label">Mode</span>
       <button class="btn mode-btn btn-active" data-mode="walk" onclick="sendAction('mode', 'walk')">🚶 Walk</button>
       <button class="btn mode-btn" data-mode="bike" onclick="sendAction('mode', 'bike')">🚲 Bike</button>
       <button class="btn mode-btn" data-mode="car" onclick="sendAction('mode', 'car')">🚗 Car</button>
@@ -1175,14 +1424,14 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
 
     <!-- Detection Mode Toggle -->
     <div class="tool-group">
-      <span class="group-label">Detect:</span>
+      <span class="group-label">Detect</span>
       <button class="btn detect-btn btn-active" data-detect="instant" onclick="sendAction('detect_mode', 'instant')" title="Instant: reroute immediately when danger touches remaining route">⚡ Instant</button>
       <button class="btn detect-btn" data-detect="lookahead" onclick="sendAction('detect_mode', 'lookahead')" title="500m: warn & reroute when danger enters 500m horizon">🔭 500m</button>
     </div>
 
     <!-- Speed Multiplier -->
     <div class="tool-group">
-      <span class="group-label">Speed:</span>
+      <span class="group-label">Speed</span>
       <button class="btn speed-btn" data-speed="1" onclick="sendAction('speed', 1)">1x</button>
       <button class="btn speed-btn btn-active" data-speed="10" onclick="sendAction('speed', 10)">10x</button>
       <button class="btn speed-btn" data-speed="50" onclick="sendAction('speed', 50)">50x</button>
@@ -1190,16 +1439,16 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
 
     <!-- Hazard Types (Click to select, or Drag directly onto the map) -->
     <div class="tool-group">
-      <span class="group-label">Hazard:</span>
-      <button class="btn hazard-btn btn-active" draggable="true" data-type="accident" onclick="selectHazard('accident')" title="Drag onto map or click to select">🚨 Accident</button>
-      <button class="btn hazard-btn" draggable="true" data-type="flooding" onclick="selectHazard('flooding')" title="Drag onto map or click to select">🌊 Flood</button>
-      <button class="btn hazard-btn" draggable="true" data-type="unsafe_area" onclick="selectHazard('unsafe_area')" title="Drag onto map or click to select">⚠️ Unsafe</button>
-      <button class="btn hazard-btn" draggable="true" data-type="construction" onclick="selectHazard('construction')" title="Drag onto map or click to select">🚧 Work</button>
-      <button class="btn hazard-btn" draggable="true" data-type="road_damage" onclick="selectHazard('road_damage')" title="Drag onto map or click to select">💥 Damage</button>
+      <span class="group-label">Hazard</span>
+      <button class="btn hazard-btn btn-active" data-type="accident" title="Drag onto map or click to select (Hotkey: Q)">🚨 Accident</button>
+      <button class="btn hazard-btn" data-type="flooding" title="Drag onto map or click to select (Hotkey: W)">🌊 Flood</button>
+      <button class="btn hazard-btn" data-type="unsafe_area" title="Drag onto map or click to select (Hotkey: E)">⚠️ Unsafe</button>
+      <button class="btn hazard-btn" data-type="construction" title="Drag onto map or click to select (Hotkey: C)">🚧 Work</button>
+      <button class="btn hazard-btn" data-type="road_damage" title="Drag onto map or click to select (Hotkey: T)">💥 Damage</button>
     </div>
 
     <!-- Feature Toggles -->
-    <div class="tool-group">
+    <div class="tool-group tool-group-end">
       <button class="btn" id="btn-explain" onclick="sendAction('explain')">🧠 Explain (L)</button>
       <button class="btn" id="btn-heatmap" onclick="sendAction('heatmap')">🔥 Heat-Map (H)</button>
     </div>
@@ -1425,49 +1674,148 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     });
 
     let isDraggingEndpoint = false;
-    let startMarker = L.marker([31.2515, 75.7047], { icon: startIcon, draggable: true, title: "Drag START location" }).addTo(map);
-    let endMarker = L.marker([31.2559, 75.7042], { icon: endIcon, draggable: true, title: "Drag GOAL location" }).addTo(map);
+    let currentStartLatLon = [31.2515, 75.7047];
+    let currentEndLatLon = [31.2559, 75.7042];
+    let startMarker = L.marker([31.2515, 75.7047], { icon: startIcon, draggable: true, title: "Drag Point 1 (START)" }).addTo(map);
+    let endMarker = L.marker([31.2559, 75.7042], { icon: endIcon, draggable: true, title: "Drag Point 2 (GOAL)" }).addTo(map);
 
     startMarker.on('dragstart', () => { isDraggingEndpoint = true; });
     startMarker.on('dragend', (e) => {
-      isDraggingEndpoint = false;
       const pos = e.target.getLatLng();
+      currentStartLatLon = [pos.lat, pos.lng];
       playBeep(700, 'sine', 0.08);
       fetch('/api/set_endpoint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ which: 'start', lat: pos.lat, lon: pos.lng })
-      }).then(r => r.json()).then(data => updateUI(data.state));
+      })
+        .then(r => r.json())
+        .then(data => { if (data && data.state) updateUI(data.state); })
+        .finally(() => { isDraggingEndpoint = false; });
     });
 
     endMarker.on('dragstart', () => { isDraggingEndpoint = true; });
     endMarker.on('dragend', (e) => {
-      isDraggingEndpoint = false;
       const pos = e.target.getLatLng();
+      currentEndLatLon = [pos.lat, pos.lng];
       playBeep(700, 'sine', 0.08);
       fetch('/api/set_endpoint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ which: 'end', lat: pos.lat, lon: pos.lng })
-      }).then(r => r.json()).then(data => updateUI(data.state));
+      })
+        .then(r => r.json())
+        .then(data => { if (data && data.state) updateUI(data.state); })
+        .finally(() => { isDraggingEndpoint = false; });
     });
 
-    // Colors & Emojis by Incident Type
+    // Colors, Emojis & Radii by Incident Type (matches config.INCIDENT_TYPES)
     const HAZARD_CONFIG = {
-      accident:     { color: '#ef4444', emoji: '🚨' },
-      flooding:     { color: '#3b82f6', emoji: '🌊' },
-      unsafe_area:  { color: '#a855f7', emoji: '⚠️' },
-      construction: { color: '#f97316', emoji: '🚧' },
-      road_damage:  { color: '#eab308', emoji: '💥' }
+      accident:     { color: '#ef4444', emoji: '🚨', radius_m: 150, label: 'Accident' },
+      flooding:     { color: '#3b82f6', emoji: '🌊', radius_m: 200, label: 'Flood' },
+      unsafe_area:  { color: '#a855f7', emoji: '⚠️', radius_m: 200, label: 'Unsafe' },
+      construction: { color: '#f97316', emoji: '🚧', radius_m: 100, label: 'Work' },
+      road_damage:  { color: '#eab308', emoji: '💥', radius_m: 60,  label: 'Damage' }
     };
 
     let selectedHazardType = 'accident';
     let draggedHazardType = null;
     let isDraggingIncident = false;
+    let suppressMapClickUntil = 0;
+
+    // Two-Point Route Selection State ('hazard' | 'pick_p1' | 'pick_p2' | 'pick_route_p1' | 'pick_route_p2')
+    let mapClickMode = 'hazard';
+    let pendingP1LatLng = null;
+    let pendingP1Marker = null;
+
+    // Responsive dock height observer so panels and attribution never collide
+    (function setupDockResizeObserver() {
+      const dock = document.getElementById('toolbar-dock');
+      if (!dock) return;
+      const syncDockHeight = () => {
+        document.documentElement.style.setProperty('--dock-h', dock.offsetHeight + 'px');
+      };
+      syncDockHeight();
+      if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(syncDockHeight).observe(dock);
+      } else {
+        window.addEventListener('resize', syncDockHeight);
+      }
+    })();
+
+    function setPickMode(mode) {
+      mapClickMode = mode;
+      pendingP1LatLng = null;
+      if (pendingP1Marker) {
+        map.removeLayer(pendingP1Marker);
+        pendingP1Marker = null;
+      }
+
+      const mapEl = document.getElementById('map');
+      const banner = document.getElementById('pick-mode-banner');
+      const bannerTxt = document.getElementById('pick-mode-text');
+      const hintEl = document.getElementById('map-hint');
+
+      document.getElementById('btn-pick-p1').classList.toggle('pick-active', mode === 'pick_p1');
+      document.getElementById('btn-pick-p2').classList.toggle('pick-active', mode === 'pick_p2');
+      document.getElementById('btn-pick-route').classList.toggle('pick-active', mode === 'pick_route_p1' || mode === 'pick_route_p2');
+
+      if (mode === 'hazard') {
+        mapEl.classList.remove('pick-cursor');
+        banner.classList.remove('visible');
+        if (hintEl) {
+          hintEl.innerHTML = '💡 <b>Interactive Map:</b> Drag any hazard button onto the road or click map to drop. Drag existing hazard icons or <b>START/GOAL</b> pins (or use <b>Pick P1 → P2</b>) to recalculate live! Right-click or ✕ to remove.';
+        }
+        return;
+      }
+
+      mapEl.classList.add('pick-cursor');
+      banner.classList.add('visible');
+      playBeep(660, 'sine', 0.06);
+
+      if (mode === 'pick_p1') {
+        bannerTxt.innerText = '📍 Click anywhere on the map to set Point 1 (Start Location)';
+        if (hintEl) hintEl.innerHTML = '📍 <b>Point 1 Mode:</b> Click on the road network to move <b>START</b> (press Esc to cancel).';
+      } else if (mode === 'pick_p2') {
+        bannerTxt.innerText = '🏁 Click anywhere on the map to set Point 2 (Destination)';
+        if (hintEl) hintEl.innerHTML = '🏁 <b>Point 2 Mode:</b> Click on the road network to move <b>GOAL</b> (press Esc to cancel).';
+      } else if (mode === 'pick_route_p1') {
+        bannerTxt.innerText = 'Step 1/2: Click anywhere on the map for Point 1 (Start)';
+        if (hintEl) hintEl.innerHTML = '🧭 <b>Two-Point Route (Step 1/2):</b> Click map to place <b>Point 1</b>, then click <b>Point 2</b> to draw safe route.';
+      } else if (mode === 'pick_route_p2') {
+        bannerTxt.innerText = 'Step 2/2: Click anywhere on the map for Point 2 (Destination)';
+        if (hintEl) hintEl.innerHTML = '🧭 <b>Two-Point Route (Step 2/2):</b> Click map for <b>Point 2</b> — blue hazard-aware route will calculate automatically!';
+      }
+    }
+
+    function togglePickRouteMode() {
+      if (mapClickMode === 'pick_route_p1' || mapClickMode === 'pick_route_p2') {
+        cancelPickMode();
+      } else {
+        setPickMode('pick_route_p1');
+      }
+    }
+
+    function cancelPickMode() {
+      setPickMode('hazard');
+    }
+
+    function swapRoutePoints() {
+      playBeep(620, 'triangle', 0.08);
+      const sLat = currentEndLatLon[0];
+      const sLon = currentEndLatLon[1];
+      const eLat = currentStartLatLon[0];
+      const eLon = currentStartLatLon[1];
+      fetch('/api/set_route_points', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start_lat: sLat, start_lon: sLon, end_lat: eLat, end_lon: eLon })
+      }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
+    }
 
     // Ghost preview circle when dragging a hazard button onto the map
     const previewCircle = L.circle([0, 0], {
-      radius: 120,
+      radius: 150,
       color: '#ef4444',
       weight: 2,
       dashArray: '6, 6',
@@ -1476,21 +1824,113 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       interactive: false
     });
 
-    // HTML5 Drag-and-Drop from toolbar hazard buttons onto the map
+    function dropHazardAtLatLng(hType, latlng) {
+      playBeep(640, 'triangle', 0.08);
+      fetch('/api/drop_incident', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lat: latlng.lat,
+          lon: latlng.lng,
+          type: hType
+        })
+      }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
+    }
+
+    function isClientPointOverMapSurface(clientX, clientY) {
+      const el = document.elementFromPoint(clientX, clientY);
+      if (!el) return false;
+      const mapContainer = document.getElementById('map');
+      return mapContainer.contains(el);
+    }
+
+    function clientPointToMapLatLng(clientX, clientY) {
+      const mapContainer = document.getElementById('map');
+      const rect = mapContainer.getBoundingClientRect();
+      const pt = L.point(clientX - rect.left, clientY - rect.top);
+      return map.containerPointToLatLng(pt);
+    }
+
+    // Unified Pointer Drag-and-Drop (works identically on mouse, trackpad, and touch)
+    const ghostEl = document.getElementById('drag-ghost-pill');
+    const ghostEmojiEl = document.getElementById('drag-ghost-emoji');
+    const ghostLabelEl = document.getElementById('drag-ghost-label');
+    let pointerDragState = null;
+
     document.querySelectorAll('.hazard-btn').forEach(btn => {
-      btn.addEventListener('dragstart', (e) => {
-        draggedHazardType = btn.dataset.type;
-        e.dataTransfer.setData('text/plain', draggedHazardType);
-        e.dataTransfer.effectAllowed = 'copy';
-        const conf = HAZARD_CONFIG[draggedHazardType] || { color: '#ef4444' };
-        previewCircle.setStyle({ color: conf.color, fillColor: conf.color });
-      });
-      btn.addEventListener('dragend', () => {
-        if (map.hasLayer(previewCircle)) map.removeLayer(previewCircle);
-        draggedHazardType = null;
+      btn.addEventListener('pointerdown', (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        pointerDragState = {
+          btn: btn,
+          type: btn.dataset.type,
+          startX: e.clientX,
+          startY: e.clientY,
+          dragging: false
+        };
       });
     });
 
+    document.addEventListener('pointermove', (e) => {
+      if (!pointerDragState) return;
+      const dx = e.clientX - pointerDragState.startX;
+      const dy = e.clientY - pointerDragState.startY;
+      if (!pointerDragState.dragging && Math.hypot(dx, dy) > 6) {
+        pointerDragState.dragging = true;
+        draggedHazardType = pointerDragState.type;
+        const conf = HAZARD_CONFIG[draggedHazardType] || HAZARD_CONFIG.accident;
+        previewCircle.setRadius(conf.radius_m || 150);
+        previewCircle.setStyle({ color: conf.color, fillColor: conf.color });
+        if (ghostEl && ghostEmojiEl && ghostLabelEl) {
+          ghostEmojiEl.innerText = conf.emoji;
+          ghostLabelEl.innerText = `Drop ${conf.label} (${conf.radius_m}m)`;
+          ghostEl.style.borderColor = conf.color;
+          ghostEl.style.display = 'flex';
+        }
+      }
+
+      if (pointerDragState.dragging) {
+        if (ghostEl) {
+          ghostEl.style.left = e.clientX + 'px';
+          ghostEl.style.top = e.clientY + 'px';
+        }
+        if (isClientPointOverMapSurface(e.clientX, e.clientY)) {
+          const latlng = clientPointToMapLatLng(e.clientX, e.clientY);
+          previewCircle.setLatLng(latlng);
+          if (!map.hasLayer(previewCircle)) previewCircle.addTo(map);
+        } else if (map.hasLayer(previewCircle)) {
+          map.removeLayer(previewCircle);
+        }
+      }
+    });
+
+    document.addEventListener('pointerup', (e) => {
+      if (!pointerDragState) return;
+      const state = pointerDragState;
+      pointerDragState = null;
+      if (ghostEl) ghostEl.style.display = 'none';
+      if (map.hasLayer(previewCircle)) map.removeLayer(previewCircle);
+      draggedHazardType = null;
+
+      if (state.dragging) {
+        suppressMapClickUntil = Date.now() + 250;
+        if (isClientPointOverMapSurface(e.clientX, e.clientY)) {
+          const latlng = clientPointToMapLatLng(e.clientX, e.clientY);
+          selectHazard(state.type, true);
+          dropHazardAtLatLng(state.type, latlng);
+        }
+      } else {
+        selectHazard(state.type);
+      }
+    });
+
+    document.addEventListener('pointercancel', () => {
+      pointerDragState = null;
+      draggedHazardType = null;
+      if (ghostEl) ghostEl.style.display = 'none';
+      if (map.hasLayer(previewCircle)) map.removeLayer(previewCircle);
+    });
+
+    // HTML5 Drag/Drop fallback on #map (if triggered programmatically)
     const mapContainer = document.getElementById('map');
     mapContainer.addEventListener('dragenter', (e) => {
       e.preventDefault();
@@ -1500,9 +1940,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     mapContainer.addEventListener('dragover', (e) => {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
-      const rect = mapContainer.getBoundingClientRect();
-      const pt = L.point(e.clientX - rect.left, e.clientY - rect.top);
-      const latlng = map.containerPointToLatLng(pt);
+      const latlng = clientPointToMapLatLng(e.clientX, e.clientY);
       previewCircle.setLatLng(latlng);
       if (!map.hasLayer(previewCircle)) previewCircle.addTo(map);
     });
@@ -1516,40 +1954,78 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
     mapContainer.addEventListener('drop', (e) => {
       e.preventDefault();
       if (map.hasLayer(previewCircle)) map.removeLayer(previewCircle);
-      const hType = e.dataTransfer.getData('text/plain') || draggedHazardType || selectedHazardType;
-      const rect = mapContainer.getBoundingClientRect();
-      const pt = L.point(e.clientX - rect.left, e.clientY - rect.top);
-      const latlng = map.containerPointToLatLng(pt);
-      playBeep(640, 'triangle', 0.08);
-      fetch('/api/drop_incident', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lat: latlng.lat,
-          lon: latlng.lng,
-          type: hType
-        })
-      }).then(r => r.json()).then(data => updateUI(data.state));
+      const hType = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedHazardType || selectedHazardType;
+      const latlng = clientPointToMapLatLng(e.clientX, e.clientY);
+      dropHazardAtLatLng(hType, latlng);
     });
 
-    // Click on Map to Drop Hazard (Fallback)
+    // Click on Map: Two-Point P1/P2 Picker OR Fallback Hazard Drop
     map.on('click', function(e) {
+      if (Date.now() < suppressMapClickUntil) return;
       if (isDraggingIncident || isDraggingEndpoint) return;
-      playBeep(640, 'triangle', 0.08);
-      fetch('/api/drop_incident', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lat: e.latlng.lat,
-          lon: e.latlng.lng,
-          type: selectedHazardType
-        })
-      }).then(r => r.json()).then(data => updateUI(data.state));
+
+      if (mapClickMode === 'pick_p1') {
+        playBeep(720, 'sine', 0.08);
+        const targetMode = 'hazard';
+        fetch('/api/set_endpoint', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ which: 'start', lat: e.latlng.lat, lon: e.latlng.lng })
+        }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
+        setPickMode(targetMode);
+        return;
+      }
+
+      if (mapClickMode === 'pick_p2') {
+        playBeep(760, 'sine', 0.08);
+        fetch('/api/set_endpoint', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ which: 'end', lat: e.latlng.lat, lon: e.latlng.lng })
+        }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
+        setPickMode('hazard');
+        return;
+      }
+
+      if (mapClickMode === 'pick_route_p1') {
+        const p1 = e.latlng;
+        setPickMode('pick_route_p2');
+        pendingP1LatLng = p1;
+        pendingP1Marker = L.marker([p1.lat, p1.lng], {
+          icon: L.divIcon({
+            html: `<div style="background:#10b981;color:#fff;font-weight:800;font-size:11px;padding:3px 8px;border-radius:8px;border:2px solid #fff;box-shadow:0 0 14px rgba(16,185,129,0.75);">P1 ✓</div>`,
+            className: '',
+            iconAnchor: [20, 14]
+          }),
+          interactive: false
+        }).addTo(map);
+        return;
+      }
+
+      if (mapClickMode === 'pick_route_p2' && pendingP1LatLng) {
+        const p1 = pendingP1LatLng;
+        const p2 = e.latlng;
+        playBeep(820, 'triangle', 0.1);
+        fetch('/api/set_route_points', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            start_lat: p1.lat,
+            start_lon: p1.lng,
+            end_lat: p2.lat,
+            end_lon: p2.lng
+          })
+        }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
+        setPickMode('hazard');
+        return;
+      }
+
+      dropHazardAtLatLng(selectedHazardType, e.latlng);
     });
 
-    function selectHazard(type) {
+    function selectHazard(type, silent = false) {
       selectedHazardType = type;
-      playBeep(520, 'sine', 0.05);
+      if (!silent) playBeep(520, 'sine', 0.05);
       document.querySelectorAll('.hazard-btn').forEach(b => {
         b.classList.toggle('btn-active', b.dataset.type === type);
       });
@@ -1560,17 +2036,21 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       playBeep(440, 'sine', 0.1);
       fetch('/api/clear_hazards', { method: 'POST' })
         .then(r => r.json())
-        .then(data => updateUI(data.state));
+        .then(data => { if (data && data.state) updateUI(data.state); });
     }
 
     function removeIncidentById(id, lat, lon, ev) {
-      if (ev) ev.stopPropagation();
+      suppressMapClickUntil = Date.now() + 300;
+      if (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
       playBeep(400, 'sine', 0.08);
       fetch('/api/remove_incident', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: id, lat: lat, lon: lon })
-      }).then(r => r.json()).then(data => updateUI(data.state));
+      }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
     }
 
     function sendAction(action, val = '') {
@@ -1582,7 +2062,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
-      }).then(r => r.json()).then(data => updateUI(data.state));
+      }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
     }
 
     // Keyboard Shortcuts
@@ -1595,13 +2075,16 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       else if (e.code === 'KeyQ') selectHazard('accident');
       else if (e.code === 'KeyW') selectHazard('flooding');
       else if (e.code === 'KeyE') selectHazard('unsafe_area');
-      else if (e.code === 'KeyR') selectHazard('construction');
+      else if (e.code === 'KeyC') selectHazard('construction');
       else if (e.code === 'KeyT') selectHazard('road_damage');
       else if (e.code === 'KeyL') sendAction('explain');
       else if (e.code === 'KeyH') sendAction('heatmap');
       else if (e.code === 'KeyG') toggleGraphEdges();
-      else if (e.code === 'KeyF5') { e.preventDefault(); sendAction('demo'); }
-      else if (e.code === 'Escape') sendAction('reset');
+      else if (e.code === 'F5' || e.code === 'KeyF5') { e.preventDefault(); sendAction('demo'); }
+      else if (e.code === 'Escape') {
+        if (mapClickMode !== 'hazard') cancelPickMode();
+        else sendAction('reset');
+      }
     });
 
     let lastWarningState = '';
@@ -1680,7 +2163,19 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
       document.getElementById('avoided-count').innerText = s.incidents_avoided || 0;
       document.getElementById('warnings-count').innerText = s.warnings_count || 0;
 
-      // 6b. Route Alternatives (P3: Fastest, Balanced, Safest)
+      // 6b. Route Points Card P1 -> P2 Coordinates
+      if (s.start_latlon && s.start_latlon.length === 2) {
+        currentStartLatLon = s.start_latlon;
+        const p1El = document.getElementById('p1-coords');
+        if (p1El) p1El.innerText = `${s.start_latlon[0].toFixed(4)}, ${s.start_latlon[1].toFixed(4)}`;
+      }
+      if (s.end_latlon && s.end_latlon.length === 2) {
+        currentEndLatLon = s.end_latlon;
+        const p2El = document.getElementById('p2-coords');
+        if (p2El) p2El.innerText = `${s.end_latlon[0].toFixed(4)}, ${s.end_latlon[1].toFixed(4)}`;
+      }
+
+      // 6c. Route Alternatives (P3: Fastest, Balanced, Safest)
       if (s.route_alternatives) {
         ['fastest', 'balanced', 'safest'].forEach(k => {
           const alt = s.route_alternatives[k];
@@ -1690,7 +2185,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
           if (alt) {
             if (statsEl) statsEl.innerText = `${alt.length_m} m • ${alt.eta_minutes} min`;
             if (riskEl) {
-              const dupText = alt.is_duplicate ? ' (shared path)' : '';
+              const dupText = alt.is_duplicate ? ' (shared)' : '';
               riskEl.innerText = `Risk: ${alt.risk.toFixed(2)}${dupText}`;
             }
             if (btnEl) btnEl.classList.toggle('active', !!alt.is_active);
@@ -1765,7 +2260,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
             s.incidents.forEach(inc => {
               const conf = HAZARD_CONFIG[inc.type] || { color: '#ef4444', emoji: '🚨' };
 
-              // Danger radius circle (P7: historical simulated incidents are dashed lighter, live are solid)
+              // Danger radius circle (historical simulated incidents dashed, live solid)
               const isHistorical = (inc.source === 'historical');
               const circle = L.circle([inc.lat, inc.lon], {
                 radius: inc.radius_m,
@@ -1773,7 +2268,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
                 weight: isHistorical ? 1.5 : 2.5,
                 dashArray: isHistorical ? '5, 6' : null,
                 fillColor: conf.color,
-                fillOpacity: isHistorical ? 0.18 : 0.35,
+                fillOpacity: isHistorical ? 0.18 : 0.34,
                 interactive: false
               }).addTo(incidentLayerGroup);
 
@@ -1786,7 +2281,7 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
                       ${conf.emoji}
                     </div>
                     <div onclick="removeIncidentById(${inc.id}, ${inc.lat}, ${inc.lon}, event)" style="position:absolute; top:-5px; right:-5px; width:16px; height:16px; border-radius:50%; background:#ef4444; color:#fff; font-size:10px; font-weight:800; line-height:14px; text-align:center; border:1.5px solid #fff; cursor:pointer; box-shadow:0 2px 5px rgba(0,0,0,0.5);" title="Remove hazard">✕</div>
-                    <div style="position:absolute; bottom:-14px; left:50%; transform:translateX(-50%); font-size:8.5px; font-weight:700; background:rgba(10,15,29,0.85); padding:1px 5px; border-radius:4px; color:${isHistorical ? '#94a3b8' : '#f87171'}; border:1px solid rgba(255,255,255,0.1); white-space:nowrap; pointer-events:none;">${isHistorical ? 'simulated' : 'live'}</div>
+                    <div style="position:absolute; bottom:-14px; left:50%; transform:translateX(-50%); font-size:8.5px; font-weight:700; background:rgba(10,15,29,0.88); padding:1px 5px; border-radius:4px; color:${isHistorical ? '#94a3b8' : '#fca5a5'}; border:1px solid rgba(255,255,255,0.12); white-space:nowrap; pointer-events:none;">${isHistorical ? 'simulated' : 'live'}</div>
                   </div>
                 `,
                 iconSize: [34, 34],
@@ -1805,16 +2300,26 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
                 circle.setLatLng(e.target.getLatLng());
               });
 
-              // On drag end: send new position to backend, immediately trigger look-ahead and reroute!
+              // On drag end: keep guard held until server completes look-ahead + reroute!
               marker.on('dragend', (e) => {
-                isDraggingIncident = false;
                 const pos = e.target.getLatLng();
                 playBeep(740, 'triangle', 0.1);
                 fetch('/api/move_incident', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ id: inc.id, lat: pos.lat, lon: pos.lng })
-                }).then(r => r.json()).then(data => updateUI(data.state));
+                })
+                  .then(r => r.json())
+                  .then(data => {
+                    isDraggingIncident = false;
+                    if (data && data.state) {
+                      lastIncidentsJson = '';
+                      updateUI(data.state);
+                    }
+                  })
+                  .catch(() => {
+                    isDraggingIncident = false;
+                  });
               });
 
               // Right click marker to remove
@@ -1824,8 +2329,8 @@ class SafeRouteWebHandler(BaseHTTPRequestHandler):
                 fetch('/api/remove_incident', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ lat: inc.lat, lon: inc.lon })
-                }).then(r => r.json()).then(data => updateUI(data.state));
+                  body: JSON.stringify({ id: inc.id, lat: inc.lat, lon: inc.lon })
+                }).then(r => r.json()).then(data => { if (data && data.state) updateUI(data.state); });
               });
             });
           }
@@ -1935,7 +2440,11 @@ def start_server(port: int = 8000, mode: str = "walk", speed: int = 10) -> None:
 
 
 if __name__ == "__main__":
-    port = 8000
-    if len(sys.argv) > 1 and sys.argv[1].isdigit():
-        port = int(sys.argv[1])
-    start_server(port=port)
+    parser = argparse.ArgumentParser(description="SafeRoute Localhost Web Simulator")
+    parser.add_argument("positional_port", nargs="?", type=int, help="Optional positional port")
+    parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
+    parser.add_argument("--mode", type=str, default="walk", choices=["walk", "bike", "car"], help="Initial mode")
+    parser.add_argument("--speed", type=int, default=10, help="Initial speed scale")
+    args = parser.parse_args()
+    final_port = args.positional_port if args.positional_port is not None else args.port
+    start_server(port=final_port, mode=args.mode, speed=args.speed)

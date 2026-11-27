@@ -179,7 +179,7 @@ class IncidentStore:
         """
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "UPDATE incidents SET lat = ?, lon = ? WHERE id = ?",
+                "UPDATE incidents SET lat = ?, lon = ?, source = 'live' WHERE id = ?",
                 (float(lat), float(lon), int(incident_id)),
             )
             conn.commit()
